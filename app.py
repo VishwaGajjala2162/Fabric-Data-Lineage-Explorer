@@ -552,9 +552,10 @@ with st.sidebar:
     st.markdown("### 🔀 Fabric Data Lineage Explorer")
     try:
         u = me()
-        st.caption(f"{u.get('name') or u.get('upn')} · **{u.get('maxRole')}**")
         if u.get("isLocalDev"):
-            st.error("LOCAL DEV - authentication disabled")
+            st.caption(f"Developer · **{api.cfg('DEVELOPER_NAME', 'Vishwa Gajjala')}**")
+        else:
+            st.caption(f"{u.get('name') or u.get('upn')} · **{u.get('maxRole')}**")
     except ApiError as e:
         show_error(e)
         st.stop()
