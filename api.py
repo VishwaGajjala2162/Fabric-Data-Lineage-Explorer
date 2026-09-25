@@ -1,0 +1,177 @@
+"""HTTP client for the FastAPI backend, with optional Entra ID device-code sign-in."""
+from __future__ import annotations
+
+import os
+from urllib.parse import quote
+
+import requests
+import streamlit as st
+
+
+def cfg(key: str, default: str = "") -> str:
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key])
+    except Exception:  # no secrets.toml
+        pass
+    return os.environ.get(key, default)
+
+
+AUTH_MODE = cfg("AUTH_MODE", "none")
+# EMBEDDED_BACKEND=true (default when no API_BASE is configured): start the FastAPI backend inside this
+# Streamlit process with local SQLite + labelled SAMPLE data. One command, works on Streamlit Community Cloud.
+EMBEDDED = cfg("EMBEDDED_BACKEND", "true" if not cfg("API_BASE") else "false").lower() == "true"
+EMBEDDED_PORT = int(cfg("EMBEDDED_PORT", "8765"))
+API_BASE = (f"http://127.0.0.1:{EMBEDDED_PORT}" if EMBEDDED else cfg("API_BASE", "http://localhost:8000")).rstrip("/")
+
+
+@st.cache_resource(show_spinner="Starting the lineage backend and loading SAMPLE data…")
+def start_embedded_backend() -> str:
+    """Run backend/app in a background thread (demo mode: auth off, SQLite, SAMPLE data)."""
+    import sys
+    import tempfile
+    import threading
+    import time
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    backend = here.parent / "backend"
+    bundle = here / "lineage_backend.zip"
+    if not (backend / "app" / "main.py").exists() and bundle.exists():
+        # Flat deployment (all files in one folder): the backend + SAMPLE files ship as a zip next to this file.
+        import zipfile
+        target = Path(tempfile.gettempdir()) / "fabric-lineage-bundle"
+        if not (target / "backend" / "app" / "main.py").exists():
+            with zipfile.ZipFile(bundle) as zf:
+                zf.extractall(target)
+        backend = target / "backend"
+    sys.path.insert(0, str(backend))
+    db_file = Path(tempfile.gettempdir()) / "fabric-lineage-demo.db"
+    os.environ.update(APP_ENV="local", AUTH_MODE="disabled", DATABASE_URL=f"sqlite:///{db_file}",
+                      UPLOAD_LOCAL_DIR=str(Path(tempfile.gettempdir()) / "fabric-lineage-uploads"),
+                      LOG_LEVEL="WARNING", CORS_ORIGINS='["*"]')
+    import uvicorn
+
+    from app.main import app  # noqa: E402  (backend package)
+
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=EMBEDDED_PORT, log_level="warning"))
+    threading.Thread(target=server.run, daemon=True).start()
+    for _ in range(100):
+        try:
+            if requests.get(f"{API_BASE}/api/health", timeout=1).ok:
+                break
+        except requests.ConnectionError:
+            time.sleep(0.2)
+    requests.post(f"{API_BASE}/api/admin/sample", timeout=120).raise_for_status()
+    return API_BASE
+
+
+if EMBEDDED:
+    start_embedded_backend()
+
+
+class ApiError(Exception):
+    def __init__(self, status: int, code: str, message: str, details=None):
+        super().__init__(message)
+        self.status, self.code, self.message, self.details = status, code, message, details
+
+
+@st.cache_resource
+def _msal_app():
+    import msal
+    return msal.PublicClientApplication(cfg("CLIENT_ID"), authority=f"https://login.microsoftonline.com/{cfg('TENANT_ID')}")
+
+
+def token() -> str | None:
+    if AUTH_MODE != "device_code":
+        return None
+    app = _msal_app()
+    accounts = app.get_accounts()
+    if accounts:
+        r = app.acquire_token_silent([cfg("API_SCOPE")], account=accounts[0])
+        if r and "access_token" in r:
+            return r["access_token"]
+    return None
+
+
+def sign_in_widget() -> bool:
+    """Render the device-code sign-in. Returns True when signed in (or auth is off)."""
+    if AUTH_MODE != "device_code" or token():
+        return True
+    app = _msal_app()
+    st.title("Sign in")
+    st.write("Sign in with your Microsoft Entra ID work account. You will only see workspaces you can access in Fabric.")
+    if "flow" not in st.session_state:
+        if st.button("Start sign-in", type="primary"):
+            st.session_state.flow = app.initiate_device_flow(scopes=[cfg("API_SCOPE")])
+            st.rerun()
+        return False
+    flow = st.session_state.flow
+    if "user_code" not in flow:
+        st.error(f"Could not start sign-in: {flow.get('error_description', flow)}")
+        del st.session_state.flow
+        return False
+    st.info(f"Go to **{flow['verification_uri']}** and enter code **{flow['user_code']}**, then click Continue.")
+    if st.button("Continue", type="primary"):
+        with st.spinner("Waiting for sign-in…"):
+            r = app.acquire_token_by_device_flow(flow)  # blocks until done or expired
+        del st.session_state.flow
+        if "access_token" not in r:
+            st.error(r.get("error_description", "Sign-in failed"))
+            return False
+        st.rerun()
+    return False
+
+
+def _req(method: str, path: str, **kw):
+    headers = kw.pop("headers", {})
+    t = token()
+    if t:
+        headers["Authorization"] = f"Bearer {t}"
+    try:
+        r = requests.request(method, f"{API_BASE}{path}", headers=headers, timeout=120, **kw)
+    except requests.ConnectionError as e:
+        raise ApiError(0, "BACKEND_UNREACHABLE", f"Cannot reach the backend at {API_BASE}. Is it running?") from e
+    if r.status_code >= 400:
+        try:
+            e = r.json().get("error", {})
+        except ValueError:
+            e = {}
+        raise ApiError(r.status_code, e.get("code", f"HTTP_{r.status_code}"), e.get("message", r.text[:300]),
+                       e.get("details"))
+    return r
+
+
+def get(path: str, **params):
+    return _req("GET", path, params={k: v for k, v in params.items() if v not in (None, "")}).json()
+
+
+def post(path: str, json=None, files=None, data=None):
+    return _req("POST", path, json=json, files=files, data=data).json()
+
+
+def put(path: str, json=None):
+    return _req("PUT", path, json=json).json()
+
+
+def delete(path: str):
+    return _req("DELETE", path).json()
+
+
+def raw(path: str, **params) -> bytes:
+    return _req("GET", path, params=params).content
+
+
+def enc(key: str) -> str:
+    return quote(key, safe="")
+
+
+def show_error(e: Exception):
+    if isinstance(e, ApiError):
+        st.error(f"**{e.code.replace('_', ' ').title()}** - {e.message}")
+        cands = (e.details or {}).get("candidates") if isinstance(e.details, dict) else None
+        if cands:
+            st.write("Matching items - choose one by ID:")
+            st.dataframe([{"name": c.get("name"), "id": c.get("id")} for c in cands], hide_index=True)
+    else:
+        st.exception(e)
