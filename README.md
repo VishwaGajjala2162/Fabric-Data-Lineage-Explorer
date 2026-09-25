@@ -9,7 +9,7 @@ All files are in this one folder:
 | `app.py` | Streamlit app (main file) |
 | `api.py` | backend client; starts the embedded backend |
 | `graph.py` | interactive lineage graph |
-| `lineage_backend.zip` | lineage engine + SAMPLE data, extracted automatically at startup |
+| `lineage_backend_bundle.py` | lineage engine + SAMPLE data (packed), unpacked automatically at startup |
 | `requirements.txt` | Python packages |
 
 **Run locally:** `pip install -r requirements.txt`, then `streamlit run app.py`.

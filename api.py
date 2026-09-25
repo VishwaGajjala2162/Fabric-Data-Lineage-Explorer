@@ -36,16 +36,36 @@ def start_embedded_backend() -> str:
 
     here = Path(__file__).resolve().parent
     backend = here.parent / "backend"
-    bundle = here / "lineage_backend.zip"
-    if not (backend / "app" / "main.py").exists() and bundle.exists():
-        # Flat deployment (all files in one folder): the backend + SAMPLE files ship as a zip next to this file.
+    if not (backend / "app" / "main.py").exists():
+        # Flat deployment (all files in one folder): the backend + SAMPLE files ship inside
+        # lineage_backend_bundle.py (a base64-encoded zip), or as lineage_backend.zip / an extracted folder.
+        import base64
+        import io
         import zipfile
         target = Path(tempfile.gettempdir()) / "fabric-lineage-bundle"
-        if not (target / "backend" / "app" / "main.py").exists():
-            with zipfile.ZipFile(bundle) as zf:
-                zf.extractall(target)
-        backend = target / "backend"
+        found = next(iter(sorted(target.glob("**/backend/app/main.py"))), None) if target.exists() else None
+        if found is None:
+            data = None
+            if (here / "lineage_backend_bundle.py").exists():
+                sys.path.insert(0, str(here))
+                import lineage_backend_bundle  # noqa: E402
+                data = base64.b64decode(lineage_backend_bundle.DATA)
+            elif (here / "lineage_backend.zip").is_file():
+                data = (here / "lineage_backend.zip").read_bytes()
+            if data:
+                with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                    zf.extractall(target)
+                found = next(iter(sorted(target.glob("**/backend/app/main.py"))), None)
+            else:  # an already-extracted folder next to this file (any nesting depth)
+                found = next(iter(sorted(here.glob("**/backend/app/main.py"))), None)
+        if found is None:
+            raise RuntimeError("Backend files not found: upload lineage_backend_bundle.py next to app.py.")
+        backend = found.parents[1]
     sys.path.insert(0, str(backend))
+    # The Streamlit main file may itself be called app.py; make sure "app" resolves to the backend package.
+    mod = sys.modules.get("app")
+    if mod is not None and not hasattr(mod, "__path__"):
+        del sys.modules["app"]
     db_file = Path(tempfile.gettempdir()) / "fabric-lineage-demo.db"
     os.environ.update(APP_ENV="local", AUTH_MODE="disabled", DATABASE_URL=f"sqlite:///{db_file}",
                       UPLOAD_LOCAL_DIR=str(Path(tempfile.gettempdir()) / "fabric-lineage-uploads"),
