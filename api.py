@@ -70,6 +70,12 @@ def start_embedded_backend() -> str:
     os.environ.update(APP_ENV="local", AUTH_MODE="disabled", DATABASE_URL=f"sqlite:///{db_file}",
                       UPLOAD_LOCAL_DIR=str(Path(tempfile.gettempdir()) / "fabric-lineage-uploads"),
                       LOG_LEVEL="WARNING", CORS_ORIGINS='["*"]')
+    # Connect to a real Fabric tenant with a service principal (values from Streamlit Secrets).
+    if cfg("FABRIC_TENANT_ID") and cfg("FABRIC_CLIENT_ID") and cfg("FABRIC_CLIENT_SECRET"):
+        os.environ.update(SERVICE_PRINCIPAL_MODE="true", TENANT_ID=cfg("FABRIC_TENANT_ID"),
+                          API_CLIENT_ID=cfg("FABRIC_CLIENT_ID"), BACKGROUND_CREDENTIAL="client_secret",
+                          LINEAGE_API_CLIENT_SECRET=cfg("FABRIC_CLIENT_SECRET"),
+                          SCANNER_ENABLED=cfg("FABRIC_USE_SCANNER_API", "true"))
     import uvicorn
 
     from app.main import app  # noqa: E402  (backend package)
@@ -82,7 +88,8 @@ def start_embedded_backend() -> str:
                 break
         except requests.ConnectionError:
             time.sleep(0.2)
-    requests.post(f"{API_BASE}/api/admin/sample", timeout=120).raise_for_status()
+    if cfg("LOAD_SAMPLE_DATA", "true").lower() == "true":
+        requests.post(f"{API_BASE}/api/admin/sample", timeout=120).raise_for_status()
     return API_BASE
 
 

@@ -458,8 +458,10 @@ def page_refresh():
         chosen = st.multiselect("Workspaces", [w["id"] for w in wss], format_func={w["id"]: w["name"] for w in wss}.get)
         c1, c2 = st.columns(2)
         mode = c1.selectbox("Mode", ["full", "incremental"])
-        ident = c2.selectbox("Identity", ["delegated", "service_principal"],
-                             help="Service-principal scans need the Metadata Administrator role.")
+        sp_only = bool(me().get("isLocalDev"))
+        ident = c2.selectbox("Identity", ["service_principal"] if sp_only else ["delegated", "service_principal"],
+                             help="Scans run as the Fabric service principal configured in Secrets." if sp_only else
+                             "Service-principal scans need the Metadata Administrator role.")
         if st.form_submit_button("Start scan", type="primary") and chosen:
             try:
                 r = api.post("/api/scans", json={"workspaceIds": chosen, "mode": mode, "identity": ident})
@@ -556,6 +558,10 @@ with st.sidebar:
             st.caption(f"Developer · **{api.cfg('DEVELOPER_NAME', 'Vishwa Gajjala')}**")
         else:
             st.caption(f"{u.get('name') or u.get('upn')} · **{u.get('maxRole')}**")
+        if u.get("fabricConnected"):
+            st.success("🟢 Connected to Microsoft Fabric")
+        else:
+            st.info("SAMPLE data only - add Fabric credentials in Secrets to connect your tenant.")
     except ApiError as e:
         show_error(e)
         st.stop()
