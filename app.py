@@ -13,7 +13,7 @@ import streamlit as st
 
 import api
 from api import ApiError, enc, show_error
-from graph import LEGEND, render
+from graph import LEGEND, MEDALLION_LEGEND, render, render_medallion
 
 st.set_page_config(page_title="Fabric Data Lineage Explorer", page_icon="🔀", layout="wide")
 
@@ -29,13 +29,24 @@ def conf(c: str | None) -> str:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def me() -> dict:
+def _me(user: str) -> dict:  # cached per signed-in person, never shared
     return api.get("/api/me")
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def workspaces() -> list[dict]:
+def _workspaces(user: str) -> list[dict]:
     return api.get("/api/workspaces")["value"]
+
+
+def me() -> dict:
+    return _me(api.user_key())
+
+
+def workspaces() -> list[dict]:
+    return _workspaces(api.user_key())
+
+
+workspaces.clear = _workspaces.clear  # type: ignore[attr-defined]
 
 
 def has_role(role: str) -> bool:
@@ -536,34 +547,323 @@ def page_admin():
 
 
 # ------------------------------------------------------------------ shell
+# ------------------------------------------------------------------ sign-in page (first page)
+def page_signin():
+    st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
+    st.title("🔀 Fabric Data Lineage Explorer")
+    st.caption("Trace every table behind a semantic model or report: Gold → Silver → Bronze → source, with the "
+               "process that loads each one.")
+    left, right = st.columns([3, 2])
+    with left:
+        st.subheader("Sign in to Microsoft Fabric")
+        if api.USER_SIGNIN:
+            st.write("Sign in with your Microsoft work account. You will see only the Fabric workspaces, semantic "
+                     "models and reports that your account can access.")
+            flow = st.session_state.get("device_flow")
+            if not flow:
+                if st.button("🔐 Sign in with Microsoft", type="primary", use_container_width=True):
+                    f = api.start_fabric_sign_in()
+                    if "user_code" not in f:
+                        st.error(f.get("error_description", "Could not start sign-in."))
+                    else:
+                        st.session_state.device_flow = f
+                        st.rerun()
+            else:
+                st.info("**Step 1:** open the Microsoft sign-in page below.  \n"
+                        f"**Step 2:** enter the code **`{flow['user_code']}`** and sign in with your work account.  \n"
+                        "**Step 3:** come back here and click **Continue**.")
+                st.link_button("Open Microsoft sign-in page ↗", flow["verification_uri"], use_container_width=True)
+                c1, c2 = st.columns(2)
+                if c1.button("Continue", type="primary", use_container_width=True):
+                    with st.spinner("Waiting for you to finish signing in…"):
+                        err = api.finish_fabric_sign_in(flow)
+                    st.session_state.pop("device_flow", None)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state.entered = True
+                        st.rerun()
+                if c2.button("Cancel", use_container_width=True):
+                    st.session_state.pop("device_flow", None)
+                    st.rerun()
+        elif api.SERVICE_PRINCIPAL:
+            st.success("This app is connected to your Fabric tenant through a service principal.")
+            if st.button("Continue", type="primary", use_container_width=True):
+                st.session_state.entered = True
+                st.rerun()
+        else:
+            st.warning("Fabric sign-in is not configured yet. Add **FABRIC_TENANT_ID** and **FABRIC_CLIENT_ID** "
+                       "to the app's Secrets to let people sign in with their Microsoft account.")
+    with right:
+        st.subheader("Just looking?")
+        st.write("Explore the labelled SAMPLE workspace (Enterprise Sales) without signing in.")
+        if st.button("Explore SAMPLE data", use_container_width=True):
+            st.session_state.entered = True
+            st.session_state.sample_only = True
+            st.rerun()
+
+
+# ------------------------------------------------------------------ semantic model / report lineage (main page)
+LAYER_BG = {"Gold": "#D4A017", "Silver": "#C0C0C0", "Bronze": "#FFE14D", "Source": "#8764B8"}
+LAYER_FG = {"Gold": "#1A1A1A", "Silver": "#1A1A1A", "Bronze": "#1A1A1A", "Source": "#FFFFFF"}
+LAYER_TITLE = {"Gold": "GOLD tables (read by the semantic model)",
+               "Silver": "SILVER tables (used to load the Gold tables)",
+               "Bronze": "BRONZE tables (used to load the Silver tables)",
+               "Source": "SOURCE system tables (used to load the Bronze tables)"}
+
+
+def _layer_header(layer: str, n: int) -> None:
+    st.markdown(f"<div style='background:{LAYER_BG[layer]};color:{LAYER_FG[layer]};padding:8px 14px;"
+                f"border-radius:6px;font-weight:700;margin-top:14px'>{LAYER_TITLE[layer]} · {n}</div>",
+                unsafe_allow_html=True)
+
+
+def _style_layer(df: pd.DataFrame):
+    def color(row):
+        bg = LAYER_BG.get(row.get("Layer"), "")
+        fg = LAYER_FG.get(row.get("Layer"), "")
+        return [f"background-color:{bg};color:{fg};font-weight:600" if c == "Layer" and bg else "" for c in row.index]
+    return df.style.apply(color, axis=1)
+
+
+def _excel(sheets: dict[str, pd.DataFrame]) -> bytes:
+    import io
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
+        for name, df in sheets.items():
+            df.to_excel(xw, sheet_name=name[:31], index=False)
+            ws = xw.sheets[name[:31]]
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = min(60, max(12, max(len(str(c.value or "")) for c in col) + 2))
+    return buf.getvalue()
+
+
+def _run_analysis(ws_id: str, item: dict) -> str | None:
+    """Make sure the item is scanned; returns its lineage key (None while a scan is still running)."""
+    scan_id = st.session_state.get("pending_scan")
+    if scan_id:
+        s_ = api.get(f"/api/scans/{scan_id}")
+        if s_["status"] in ("Queued", "Running"):
+            st.info(f"Reading **{item['name']}** and its workspace from Fabric… this can take a few minutes.")
+            st.progress(0.5 if s_["status"] == "Running" else 0.1)
+            time.sleep(3)
+            st.rerun()
+        st.session_state.pop("pending_scan", None)
+        problems = [i for i in s_.get("issues") or [] if i["severity"] in ("warning", "error")]
+        if s_["status"] == "Failed":
+            st.error(f"The scan failed: {s_.get('error')}")
+            return None
+        if problems:
+            with st.expander(f"⚠️ {len(problems)} item(s) could not be fully read from Fabric - lineage may be partial"):
+                st.dataframe(pd.DataFrame(problems)[["itemName", "itemType", "code", "message"]], hide_index=True,
+                             use_container_width=True)
+    r = api.post("/api/lineage/analyze", json={"workspace": ws_id, "itemType": item["type"], "itemId": item["id"]})
+    if r["status"] == "scanning":
+        st.session_state.pending_scan = r["scanRunId"]
+        st.rerun()
+    return r["rootKey"]
+
+
+def page_model_report():
+    st.title("Semantic model & report lineage")
+    try:
+        wss = workspaces()
+    except ApiError as e:
+        return show_error(e)
+    if st.session_state.get("sample_only"):
+        wss = [w for w in wss if w.get("isSample")]
+    if not wss:
+        return st.warning("No Fabric workspaces are available to your account.")
+    names = {w["id"]: w["name"] + ("  · SAMPLE" if w.get("isSample") else "") for w in wss}
+    def reset_items():
+        st.session_state["mr_model"] = None
+        st.session_state["mr_report"] = None
+        st.session_state.pop("pending_scan", None)
+
+    ws_id = st.selectbox("Workspace", list(names), format_func=names.get, key="mr_ws", on_change=reset_items)
+    try:
+        items = api.get(f"/api/workspaces/{ws_id}/items")["value"]
+    except ApiError as e:
+        return show_error(e)
+    models = [i for i in items if i["type"] == "SemanticModel"]
+    reports = [i for i in items if i["type"] == "Report"]
+
+    def pick(kind: str):
+        other = "mr_report" if kind == "mr_model" else "mr_model"
+        if st.session_state.get(kind) is not None:
+            st.session_state[other] = None
+        st.session_state.pop("pending_scan", None)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### 🔶 Semantic models")
+        model = st.selectbox(f"{len(models)} semantic model(s)", models, index=None, key="mr_model",
+                             format_func=lambda i: i["name"], placeholder="Select a semantic model",
+                             on_change=pick, args=("mr_model",))
+    with c2:
+        st.markdown("#### 📊 Reports")
+        report = st.selectbox(f"{len(reports)} report(s)", reports, index=None, key="mr_report",
+                              format_func=lambda i: i["name"], placeholder="Select a report",
+                              on_change=pick, args=("mr_report",))
+    item = model or report
+    if not item:
+        st.info("Select a semantic model **or** a report to see the Gold, Silver and Bronze tables behind it.")
+        return
+    try:
+        key = _run_analysis(ws_id, item)
+        if not key:
+            return
+        d = api.get("/api/lineage/medallion", itemKey=key)
+    except ApiError as e:
+        return show_error(e)
+
+    title = f"Report **{d['report']['name']}** → semantic model **{d['model']['name']}**" if d.get("report") \
+        else f"Semantic model **{d['model']['name']}**"
+    st.markdown(title + ("  ·  🔖 SAMPLE DATA" if d.get("isSample") else ""))
+    m = st.columns(4)
+    for col, layer in zip(m, ["Gold", "Silver", "Bronze", "Source"]):
+        col.markdown(f"<div style='background:{LAYER_BG[layer]};color:{LAYER_FG[layer]};border-radius:8px;"
+                     f"padding:10px;text-align:center'><div style='font-size:13px'>{layer.upper()}</div>"
+                     f"<div style='font-size:28px;font-weight:700'>{d['summary'].get(layer, 0)}</div>"
+                     f"<div style='font-size:12px'>tables</div></div>", unsafe_allow_html=True)
+
+    tables = pd.DataFrame([{"Layer": t["layer"], "Table": t["qualifiedName"], "Loaded by (process)": t["loadedBy"],
+                            "Loaded from": t["loadedFrom"], "Feeds": t["feeds"],
+                            "Confidence": t.get("confidence") or "", "Layer based on": t["layerBasis"]}
+                           for t in d["tables"]])
+    paths = pd.DataFrame(d["paths"])
+    hops = pd.DataFrame([{"Target layer": r["toLayer"], "Target table": r["toName"], "Loaded by": r["process"],
+                          "Process type": r["processType"], "Source layer": r["fromLayer"],
+                          "Source table": r["fromName"], "Columns mapped": r["columns"],
+                          "Confidence": r["confidence"], "Note": r.get("reason") or ""} for r in d["relations"]])
+
+    view = st.radio("View", ["📋 Table lineage", "🔀 Lineage graph", "⬇️ Download"], horizontal=True,
+                    key="mr_view", label_visibility="collapsed")
+    st.divider()
+    if view.endswith("Table lineage"):
+        st.caption("Which tables feed the model, and which process loads each one. Confidence: Confirmed / Parsed "
+                   "come from definitions and code; Inferred means the pairing was matched by name - verify it.")
+        with st.expander("Semantic-model tables and the Gold tables they read", expanded=False):
+            st.dataframe(pd.DataFrame(d["modelTables"]).rename(columns={
+                "modelTable": "Model table", "storageMode": "Storage mode", "sourceTables": "Reads from",
+                "unresolved": "Unresolved"}), hide_index=True, use_container_width=True)
+        for layer in ["Gold", "Silver", "Bronze", "Source"]:
+            part = tables[tables["Layer"] == layer] if not tables.empty else tables
+            _layer_header(layer, len(part))
+            if part.empty:
+                st.caption("No tables found in this layer in the scanned metadata.")
+            else:
+                st.dataframe(_style_layer(part.drop(columns=["Layer based on"] if layer == "Source" else [])),
+                             hide_index=True, use_container_width=True)
+        st.markdown("#### End-to-end: Gold → Silver → Bronze → Source")
+        if paths.empty:
+            st.caption("No complete paths found.")
+        else:
+            st.dataframe(paths.replace("", "-"), hide_index=True, use_container_width=True)
+    elif view.endswith("Lineage graph"):
+        st.caption("Flow from the selected item through GOLD → SILVER → BRONZE → source. Each arrow reads "
+                   "\"is loaded from\"; each box shows the process (⚙) that loads it. Hover a box or arrow for details, "
+                   "click a box to trace its lineage.")
+        render_medallion(d)
+        st.markdown(MEDALLION_LEGEND, unsafe_allow_html=True)
+    else:
+        base = (d["report"] or d["model"])["name"].replace(" ", "_")
+        st.write("Download the tables, the process that loads each one, and the complete Gold → Silver → Bronze paths.")
+        c1, c2 = st.columns(2)
+        c1.download_button("⬇️ Excel workbook (all sheets)", _excel({"Paths Gold-Silver-Bronze": paths,
+                                                                     "Tables by layer": tables,
+                                                                     "Loads (hop by hop)": hops}),
+                           f"{base}_lineage.xlsx", use_container_width=True, type="primary",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        c2.download_button("⬇️ CSV - end-to-end paths", paths.to_csv(index=False), f"{base}_lineage_paths.csv",
+                           "text/csv", use_container_width=True)
+        c1.download_button("⬇️ CSV - tables by layer", tables.to_csv(index=False), f"{base}_tables_by_layer.csv",
+                           "text/csv", use_container_width=True)
+        c2.download_button("⬇️ CSV - loading processes", hops.to_csv(index=False), f"{base}_loading_processes.csv",
+                           "text/csv", use_container_width=True)
+        st.dataframe(hops, hide_index=True, use_container_width=True)
+
+
+def _auth_configured() -> bool:
+    try:
+        return "auth" in st.secrets
+    except Exception:  # no secrets.toml
+        return False
+
+
+def _signed_in_email() -> str:
+    return str(st.user.get("email") or st.user.get("preferred_username") or "").lower()
+
+
+def require_microsoft_sign_in() -> bool:
+    """Optional sign-in gate: active when an [auth] section exists in Streamlit Secrets.
+
+    Only accounts from the tenant in server_metadata_url can sign in; ALLOWED_USERS (emails) and/or
+    ALLOWED_DOMAINS narrow it further. Nothing else in the app renders until the check passes.
+    """
+    if not _auth_configured():
+        return True
+    provider = "microsoft" if "microsoft" in st.secrets["auth"] else None
+    if not st.user.is_logged_in:
+        st.title("🔀 Fabric Data Lineage Explorer")
+        st.write("This app shows Microsoft Fabric metadata. Sign in with your work account to continue.")
+        if st.button("Sign in with Microsoft", type="primary"):
+            st.login(provider) if provider else st.login()
+        return False
+    email = _signed_in_email()
+    users = {u.strip().lower() for u in api.cfg("ALLOWED_USERS", "").split(",") if u.strip()}
+    domains = {d.strip().lower().lstrip("@") for d in api.cfg("ALLOWED_DOMAINS", "").split(",") if d.strip()}
+    if (users or domains) and email not in users and email.rsplit("@", 1)[-1] not in domains:
+        st.error(f"{email or 'This account'} is not allowed to use this app. Ask the app owner for access.")
+        st.button("Sign out", on_click=st.logout)
+        return False
+    return True
+
+
+if not require_microsoft_sign_in():
+    st.stop()
 if not api.sign_in_widget():
     st.stop()
 
 PAGES = {
-    "analyze": st.Page(page_analyze, title="Analyze lineage", icon="🔍", default=True),
-    "workspaces": st.Page(page_workspaces, title="Workspace explorer", icon="🗂️", url_path="workspaces"),
-    "lineage": st.Page(page_lineage, title="Lineage graph", icon="🔀", url_path="lineage"),
+    "main": st.Page(page_model_report, title="Semantic model & report lineage", icon="🏅", url_path="lineage-overview",
+                    default=True),
+    "lineage": st.Page(page_lineage, title="Detailed lineage graph", icon="🔀", url_path="lineage"),
     "details": st.Page(page_details, title="Table / column / measure", icon="📋", url_path="details"),
     "impact": st.Page(page_impact, title="Impact analysis", icon="⚠️", url_path="impact"),
-    "upload": st.Page(page_upload, title="Upload metadata", icon="📤", url_path="upload"),
+    "workspaces": st.Page(page_workspaces, title="Workspace explorer", icon="🗂️", url_path="workspaces"),
     "refresh": st.Page(page_refresh, title="Metadata refresh", icon="🔄", url_path="refresh"),
-    "admin": st.Page(page_admin, title="Administration", icon="⚙️", url_path="admin"),
 }
+# Upload metadata and Administration are intentionally not in the menu.
+
+signed_in = api.fabric_signed_in() or api.SERVICE_PRINCIPAL or st.session_state.get("sample_only")
+if not (st.session_state.get("entered") and signed_in):
+    st.navigation([st.Page(page_signin, title="Sign in", icon="🔐", default=True)], position="hidden").run()
+    st.stop()
 
 with st.sidebar:
     st.markdown("### 🔀 Fabric Data Lineage Explorer")
     try:
         u = me()
-        if u.get("isLocalDev"):
+        if api.fabric_signed_in():
+            acct = api.signed_in_account()
+            st.caption(f"Signed in · **{u.get('name') or acct.get('username', '')}**")
+            st.caption(acct.get("username", ""))
+        elif _auth_configured() and st.user.is_logged_in:
+            st.caption(f"Signed in · **{st.user.get('name') or _signed_in_email()}**")
+        else:
             st.caption(f"Developer · **{api.cfg('DEVELOPER_NAME', 'Vishwa Gajjala')}**")
-        else:
-            st.caption(f"{u.get('name') or u.get('upn')} · **{u.get('maxRole')}**")
-        if u.get("fabricConnected"):
+        if st.session_state.get("sample_only"):
+            st.info("Viewing SAMPLE data")
+        elif u.get("fabricConnected"):
             st.success("🟢 Connected to Microsoft Fabric")
-        else:
-            st.info("SAMPLE data only - add Fabric credentials in Secrets to connect your tenant.")
     except ApiError as e:
         show_error(e)
         st.stop()
+    if st.button("Sign out", use_container_width=True):
+        if _auth_configured() and st.user.is_logged_in:
+            st.logout()
+        api.fabric_sign_out()
+        st.rerun()
 
 st.navigation(list(PAGES.values())).run()

@@ -70,6 +70,8 @@ def start_embedded_backend() -> str:
     os.environ.update(APP_ENV="local", AUTH_MODE="disabled", DATABASE_URL=f"sqlite:///{db_file}",
                       UPLOAD_LOCAL_DIR=str(Path(tempfile.gettempdir()) / "fabric-lineage-uploads"),
                       LOG_LEVEL="WARNING", CORS_ORIGINS='["*"]')
+    if cfg("FABRIC_CLIENT_ID") and not cfg("FABRIC_CLIENT_SECRET"):
+        os.environ["TOKEN_PASSTHROUGH"] = "true"  # each person signs in with their own account
     # Connect to a real Fabric tenant with a service principal (values from Streamlit Secrets).
     if cfg("FABRIC_TENANT_ID") and cfg("FABRIC_CLIENT_ID") and cfg("FABRIC_CLIENT_SECRET"):
         os.environ.update(SERVICE_PRINCIPAL_MODE="true", TENANT_ID=cfg("FABRIC_TENANT_ID"),
@@ -103,10 +105,14 @@ class ApiError(Exception):
         self.status, self.code, self.message, self.details = status, code, message, details
 
 
-@st.cache_resource
 def _msal_app():
+    """One MSAL client per browser session, so token caches are never shared between users."""
     import msal
-    return msal.PublicClientApplication(cfg("CLIENT_ID"), authority=f"https://login.microsoftonline.com/{cfg('TENANT_ID')}")
+    if "_msal_app" not in st.session_state:
+        st.session_state._msal_app = msal.PublicClientApplication(
+            cfg("CLIENT_ID") or cfg("FABRIC_CLIENT_ID"),
+            authority=f"https://login.microsoftonline.com/{cfg('TENANT_ID') or cfg('FABRIC_TENANT_ID') or 'organizations'}")
+    return st.session_state._msal_app
 
 
 def token() -> str | None:
@@ -150,11 +156,92 @@ def sign_in_widget() -> bool:
     return False
 
 
+# ---------------------------------------------------------------- Fabric sign-in (per user)
+# Configured when FABRIC_CLIENT_ID is set without FABRIC_CLIENT_SECRET: every person signs in with their own
+# Microsoft account and only sees the Fabric workspaces they can open. Tokens stay in this session's memory
+# and are passed to the embedded backend on 127.0.0.1 only.
+USER_SIGNIN = bool(cfg("FABRIC_CLIENT_ID")) and not cfg("FABRIC_CLIENT_SECRET")
+SERVICE_PRINCIPAL = bool(cfg("FABRIC_CLIENT_ID") and cfg("FABRIC_CLIENT_SECRET") and cfg("FABRIC_TENANT_ID"))
+FABRIC_SCOPES = cfg("FABRIC_SCOPES", "https://api.fabric.microsoft.com/Workspace.Read.All "
+                                     "https://api.fabric.microsoft.com/Item.ReadWrite.All").split()
+POWERBI_SCOPES = cfg("POWERBI_SCOPES", "https://analysis.windows.net/powerbi/api/Report.Read.All "
+                                       "https://analysis.windows.net/powerbi/api/Dataset.Read.All").split()
+
+
+def _silent(scopes: list[str]) -> str:
+    if "_msal_app" not in st.session_state:  # nobody has signed in in this session yet (no network call needed)
+        return ""
+    app = _msal_app()
+    accounts = app.get_accounts()
+    if not accounts:
+        return ""
+    r = app.acquire_token_silent(scopes, account=accounts[0])
+    return r["access_token"] if r and "access_token" in r else ""
+
+
+def fabric_signed_in() -> bool:
+    return USER_SIGNIN and bool(_silent(FABRIC_SCOPES))
+
+
+def signed_in_account() -> dict:
+    accounts = _msal_app().get_accounts() if USER_SIGNIN and "_msal_app" in st.session_state else []
+    return accounts[0] if accounts else {}
+
+
+def start_fabric_sign_in() -> dict:
+    """Returns the device-code flow, or {"error_description": ...} when Microsoft sign-in cannot be reached."""
+    try:
+        return _msal_app().initiate_device_flow(scopes=FABRIC_SCOPES)
+    except ValueError as e:  # unknown tenant / bad authority
+        st.session_state.pop("_msal_app", None)
+        return {"error_description": f"The tenant ID was not recognised by Microsoft Entra ID. Check FABRIC_TENANT_ID "
+                                     f"in the app Secrets. ({str(e)[:150]})"}
+    except Exception as e:  # network / proxy
+        st.session_state.pop("_msal_app", None)
+        return {"error_description": f"Could not reach login.microsoftonline.com ({type(e).__name__}). "
+                                     f"Check the network and FABRIC_TENANT_ID, then try again."}
+
+
+def finish_fabric_sign_in(flow: dict) -> str | None:
+    """Blocks until the person completes sign-in in their browser. Returns an error message or None."""
+    try:
+        r = _msal_app().acquire_token_by_device_flow(flow)
+    except Exception as e:
+        return f"Sign-in failed: could not reach Microsoft Entra ID ({type(e).__name__})."
+    if "access_token" in r:
+        return None
+    desc = r.get("error_description", r.get("error", "Sign-in failed"))
+    if "AADSTS65001" in desc:
+        return ("Consent is required for this app's Fabric permissions. Ask an administrator to grant admin consent "
+                "on the app registration (API permissions > Grant admin consent).")
+    if "AADSTS7000218" in desc:
+        return "Turn on 'Allow public client flows' on the app registration (Authentication page)."
+    return desc.split("\r\n")[0][:300]
+
+
+def fabric_sign_out() -> None:
+    for k in list(st.session_state.keys()):
+        del st.session_state[k]
+
+
+def user_key() -> str:
+    """Cache partition key: one per signed-in person (or one for anonymous / sample sessions)."""
+    acct = signed_in_account()
+    return acct.get("home_account_id", "anonymous") if acct else "anonymous"
+
+
 def _req(method: str, path: str, **kw):
     headers = kw.pop("headers", {})
     t = token()
     if t:
         headers["Authorization"] = f"Bearer {t}"
+    if USER_SIGNIN and EMBEDDED:
+        ft = _silent(FABRIC_SCOPES)
+        if ft:
+            headers["X-Fabric-Token"] = ft
+            pt = _silent(POWERBI_SCOPES)
+            if pt:
+                headers["X-PowerBI-Token"] = pt
     try:
         r = requests.request(method, f"{API_BASE}{path}", headers=headers, timeout=120, **kw)
     except requests.ConnectionError as e:
