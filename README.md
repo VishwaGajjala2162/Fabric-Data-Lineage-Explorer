@@ -20,5 +20,6 @@ with the process (notebook, pipeline, shortcut, dataflow) that loads each table.
 
 **Streamlit Community Cloud:** main file path `app.py`.
 
-**Connect Fabric:** add `FABRIC_TENANT_ID` and `FABRIC_CLIENT_ID` in Manage app → Settings → Secrets (see
-`secrets.toml.example`, which is not uploaded to GitHub). Without them, only the labelled SAMPLE data is available.
+**Connect Fabric:** nothing to configure. On the first page choose **App credentials** (tenant ID, client ID,
+client secret of an app registration) or **My Microsoft account**, and click Connect. The details stay only in
+that browser session's memory. The app then lists your Fabric capacities, workspaces, semantic models and reports.

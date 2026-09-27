@@ -43,7 +43,33 @@ def me() -> dict:
 
 
 def workspaces() -> list[dict]:
-    return _workspaces(api.user_key())
+    wss = _workspaces(api.user_key())
+    if api.fabric_signed_in():  # signed in to Fabric: only the tenant's own workspaces, no SAMPLE data
+        wss = [w for w in wss if not w.get("isSample")]
+    return wss
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _capacity_names(user: str) -> dict[str, str]:
+    try:
+        return {c["id"]: f"{c['name']}  ({c['sku']})" if c.get("sku") else c["name"]
+                for c in api.get("/api/capacities")["value"]}
+    except ApiError:
+        return {}
+
+
+@st.cache_data(ttl=300, show_spinner="Loading semantic models and reports from all your workspaces…")
+def _tenant_items(user: str, ws: tuple[tuple[str, str], ...]) -> tuple[list[dict], list[str]]:
+    """Semantic models and reports of every workspace the person can open (cached per person)."""
+    res = api.get_many([f"/api/workspaces/{wid}/items" for wid, _ in ws])
+    items, failed = [], []
+    for wid, wname in ws:
+        r = res.get(f"/api/workspaces/{wid}/items")
+        if isinstance(r, ApiError):
+            failed.append(wname)
+            continue
+        items += [dict(i, _ws=wid, _wsName=wname) for i in r["value"] if i["type"] in ("SemanticModel", "Report")]
+    return items, failed
 
 
 workspaces.clear = _workspaces.clear  # type: ignore[attr-defined]
@@ -548,55 +574,109 @@ def page_admin():
 
 # ------------------------------------------------------------------ shell
 # ------------------------------------------------------------------ sign-in page (first page)
+def _enter_app() -> None:
+    st.session_state.entered = True
+    st.session_state.pop("sample_only", None)
+    workspaces.clear()
+    st.rerun()
+
+
 def page_signin():
     st.markdown("<div style='height:24px'></div>", unsafe_allow_html=True)
     st.title("🔀 Fabric Data Lineage Explorer")
     st.caption("Trace every table behind a semantic model or report: Gold → Silver → Bronze → source, with the "
                "process that loads each one.")
-    left, right = st.columns([3, 2])
+    left, right = st.columns([3, 2], gap="large")
     with left:
-        st.subheader("Sign in to Microsoft Fabric")
-        if api.USER_SIGNIN:
-            st.write("Sign in with your Microsoft work account. You will see only the Fabric workspaces, semantic "
-                     "models and reports that your account can access.")
-            flow = st.session_state.get("device_flow")
-            if not flow:
-                if st.button("🔐 Sign in with Microsoft", type="primary", use_container_width=True):
-                    f = api.start_fabric_sign_in()
-                    if "user_code" not in f:
-                        st.error(f.get("error_description", "Could not start sign-in."))
+        st.subheader("Connect to your Microsoft Fabric")
+        err = st.session_state.pop("sign_in_error", None)
+        if err:
+            st.error(err)
+        how = st.radio("Connect with", ["🔑 App credentials (service principal)", "👤 My Microsoft account"],
+                       horizontal=True, key="signin_how")
+        if how.startswith("🔑"):
+            with st.form("sp_form", border=True):
+                tenant = st.text_input("Directory (tenant) ID", value=api.default_tenant(),
+                                       placeholder="e.g. 72f988bf-86f1-41af-91ab-2d7cd011db47 or contoso.onmicrosoft.com")
+                client = st.text_input("Application (client) ID", value=api.default_client_id(),
+                                       placeholder="e.g. 3f2a9c1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b")
+                secret = st.text_input("Client secret (Value)", type="password", placeholder="the secret Value")
+                go = st.form_submit_button("Connect to Fabric", type="primary", use_container_width=True)
+            st.caption("🔒 These details stay only in this browser session's memory. They are not saved and are "
+                       "sent only to Microsoft to get an access token. Signing out or closing the tab forgets them.")
+            if go:
+                with st.spinner("Connecting to Microsoft Fabric…"):
+                    e = api.connect_service_principal(tenant, client, secret)
+                if e:
+                    st.error(e)
+                else:
+                    _enter_app()
+            with st.expander("Where do I find these values?"):
+                st.markdown(
+                    "1. **Azure portal → Microsoft Entra ID → App registrations → your app → Overview**: copy the "
+                    "**Directory (tenant) ID** and **Application (client) ID**.\n"
+                    "2. **Certificates & secrets → New client secret**: copy the **Value** (shown only once).\n"
+                    "3. **Fabric admin portal → Tenant settings → Developer settings**: enable *Service principals "
+                    "can use Fabric APIs* (for your app's security group).\n"
+                    "4. In Fabric, open each **workspace → Manage access** and add the app as **Contributor**. "
+                    "The app sees only the workspaces it was added to.")
+            if api.saved_service_principal():
+                if st.button("Use the connection saved in the app settings", use_container_width=True):
+                    with st.spinner("Connecting to Microsoft Fabric…"):
+                        e = api.connect_service_principal(api.default_tenant(), api.default_client_id(),
+                                                          api.cfg("FABRIC_CLIENT_SECRET"))
+                    if e:
+                        st.error(e)
                     else:
-                        st.session_state.device_flow = f
-                        st.rerun()
-            else:
-                st.info("**Step 1:** open the Microsoft sign-in page below.  \n"
-                        f"**Step 2:** enter the code **`{flow['user_code']}`** and sign in with your work account.  \n"
-                        "**Step 3:** come back here and click **Continue**.")
-                st.link_button("Open Microsoft sign-in page ↗", flow["verification_uri"], use_container_width=True)
-                c1, c2 = st.columns(2)
-                if c1.button("Continue", type="primary", use_container_width=True):
-                    with st.spinner("Waiting for you to finish signing in…"):
-                        err = api.finish_fabric_sign_in(flow)
-                    st.session_state.pop("device_flow", None)
-                    if err:
-                        st.error(err)
-                    else:
-                        st.session_state.entered = True
-                        st.rerun()
-                if c2.button("Cancel", use_container_width=True):
-                    st.session_state.pop("device_flow", None)
-                    st.rerun()
-        elif api.SERVICE_PRINCIPAL:
-            st.success("This app is connected to your Fabric tenant through a service principal.")
-            if st.button("Continue", type="primary", use_container_width=True):
-                st.session_state.entered = True
-                st.rerun()
+                        _enter_app()
         else:
-            st.warning("Fabric sign-in is not configured yet. Add **FABRIC_TENANT_ID** and **FABRIC_CLIENT_ID** "
-                       "to the app's Secrets to let people sign in with their Microsoft account.")
+            st.write("Sign in as yourself: you will see only the workspaces, semantic models and reports your own "
+                     "account can open. Microsoft requires its own page for the password and MFA step.")
+            if api.REDIRECT_SIGNIN:
+                url, e = api.sign_in_url()
+                if e:
+                    st.error(e)
+                else:
+                    st.link_button("🔐 Sign in with Microsoft", url, type="primary", use_container_width=True)
+                    st.caption("The Microsoft sign-in page opens in a new tab and returns to the app there.")
+            else:
+                flow = st.session_state.get("device_flow")
+                if not flow:
+                    with st.form("dev_form", border=True):
+                        tenant = st.text_input("Directory (tenant) ID or domain", value=api.default_tenant(),
+                                               placeholder="e.g. contoso.onmicrosoft.com")
+                        client = st.text_input("Application (client) ID", value=api.default_client_id(),
+                                               help="An app registration with 'Allow public client flows' = Yes and "
+                                                    "delegated Power BI Service permissions.")
+                        go = st.form_submit_button("Get sign-in code", type="primary", use_container_width=True)
+                    if go:
+                        f = api.start_device_sign_in(tenant, client)
+                        if "user_code" not in f:
+                            st.error(f.get("error_description", "Could not start sign-in."))
+                        else:
+                            st.session_state.device_flow = f
+                            st.rerun()
+                else:
+                    st.info(f"**1.** Open the Microsoft page below.  \n**2.** Enter the code **`{flow['user_code']}`** "
+                            f"and sign in with your work account.  \n**3.** Come back here and click **Continue**.")
+                    st.link_button("Open Microsoft sign-in page ↗", flow["verification_uri"],
+                                   use_container_width=True)
+                    c1, c2 = st.columns(2)
+                    if c1.button("Continue", type="primary", use_container_width=True):
+                        with st.spinner("Checking your sign-in…"):
+                            e = api.finish_device_sign_in(flow)
+                        st.session_state.pop("device_flow", None)
+                        if e:
+                            st.session_state.sign_in_error = e
+                            st.rerun()
+                        _enter_app()
+                    if c2.button("Cancel", use_container_width=True):
+                        st.session_state.pop("device_flow", None)
+                        st.session_state.pop("_pending_device", None)
+                        st.rerun()
     with right:
         st.subheader("Just looking?")
-        st.write("Explore the labelled SAMPLE workspace (Enterprise Sales) without signing in.")
+        st.write("Explore the labelled SAMPLE workspace (Enterprise Sales) without connecting.")
         if st.button("Explore SAMPLE data", use_container_width=True):
             st.session_state.entered = True
             st.session_state.sample_only = True
@@ -639,7 +719,14 @@ def _excel(sheets: dict[str, pd.DataFrame]) -> bytes:
 
 
 def _run_analysis(ws_id: str, item: dict) -> str | None:
-    """Make sure the item is scanned; returns its lineage key (None while a scan is still running)."""
+    """Make sure the item is scanned; returns its lineage key (None while a scan runs or when it could not be read)."""
+    failed = st.session_state.setdefault("scan_failed", {})
+    if item["id"] in failed:  # never re-scan in a loop; the person decides
+        st.error(failed[item["id"]])
+        if st.button("🔄 Try again", key=f"retry_{item['id']}"):
+            failed.pop(item["id"], None)
+            st.rerun()
+        return None
     scan_id = st.session_state.get("pending_scan")
     if scan_id:
         s_ = api.get(f"/api/scans/{scan_id}")
@@ -649,17 +736,27 @@ def _run_analysis(ws_id: str, item: dict) -> str | None:
             time.sleep(3)
             st.rerun()
         st.session_state.pop("pending_scan", None)
+        key = st.session_state.pop("pending_key", None)
         problems = [i for i in s_.get("issues") or [] if i["severity"] in ("warning", "error")]
-        if s_["status"] == "Failed":
-            st.error(f"The scan failed: {s_.get('error')}")
-            return None
         if problems:
             with st.expander(f"⚠️ {len(problems)} item(s) could not be fully read from Fabric - lineage may be partial"):
                 st.dataframe(pd.DataFrame(problems)[["itemName", "itemType", "code", "message"]], hide_index=True,
                              use_container_width=True)
+        try:
+            if s_["status"] == "Failed" or not key:
+                raise ApiError(0, "SCAN_FAILED", s_.get("error") or "")
+            api.get(f"/api/nodes/{enc(key)}")
+            return key
+        except ApiError:
+            why = s_.get("error") or (problems[0]["message"] if problems else "")
+            failed[item["id"]] = (f"**{item['name']}** could not be read from Fabric"
+                                  f"{': ' + why if why else '.'} Check that your account has at least Contributor "
+                                  f"access to the workspace '{item.get('_wsName', '')}'.")
+            st.rerun()
     r = api.post("/api/lineage/analyze", json={"workspace": ws_id, "itemType": item["type"], "itemId": item["id"]})
     if r["status"] == "scanning":
         st.session_state.pending_scan = r["scanRunId"]
+        st.session_state.pending_key = r["rootKey"]
         st.rerun()
     return r["rootKey"]
 
@@ -673,18 +770,46 @@ def page_model_report():
     if st.session_state.get("sample_only"):
         wss = [w for w in wss if w.get("isSample")]
     if not wss:
+        if api.connection().get("kind") == "sp":
+            return st.warning("This service principal cannot see any Fabric workspace yet. In Fabric, open a "
+                              "workspace → **Manage access** → add the app as **Contributor**, and make sure the "
+                              "tenant setting *Service principals can use Fabric APIs* is enabled for it.")
         return st.warning("No Fabric workspaces are available to your account.")
-    names = {w["id"]: w["name"] + ("  · SAMPLE" if w.get("isSample") else "") for w in wss}
+
     def reset_items():
         st.session_state["mr_model"] = None
         st.session_state["mr_report"] = None
         st.session_state.pop("pending_scan", None)
 
-    ws_id = st.selectbox("Workspace", list(names), format_func=names.get, key="mr_ws", on_change=reset_items)
+    connected = api.fabric_signed_in()
+    if connected:  # capacity -> workspace -> semantic model / report
+        caps = _capacity_names(api.user_key())
+        cap_ids = sorted({w.get("capacityId") or "" for w in wss}, key=lambda c: (c == "", caps.get(c, c).lower()))
+        cap_label = {"__all__": f"All capacities ({len(cap_ids)})", "": "Shared capacity (Pro / no Fabric capacity)",
+                     **{c: caps.get(c) or f"Capacity {c[:8]}…" for c in cap_ids if c}}
+        cap = st.selectbox("Fabric capacity", ["__all__"] + cap_ids, format_func=cap_label.get, key="mr_cap",
+                           on_change=lambda: (st.session_state.pop("mr_ws", None), reset_items()))
+        if cap != "__all__":
+            wss = [w for w in wss if (w.get("capacityId") or "") == cap]
+    names = {w["id"]: w["name"] + ("  · SAMPLE" if w.get("isSample") else "") for w in wss}
+    all_ws = "__all__"
+    options = list(names)
+    if connected and len(wss) > 1:
+        options = [all_ws] + options
+        names[all_ws] = f"All workspaces ({len(wss)})"
+    ws_id = st.selectbox("Workspace", options, format_func=names.get, key="mr_ws", on_change=reset_items)
     try:
-        items = api.get(f"/api/workspaces/{ws_id}/items")["value"]
+        if ws_id == all_ws:
+            items, failed = _tenant_items(api.user_key(), tuple((w["id"], w["name"]) for w in wss))
+            if failed:
+                st.caption(f"⚠️ Could not list items in {len(failed)} workspace(s): {', '.join(failed[:5])}"
+                           f"{'…' if len(failed) > 5 else ''}")
+        else:
+            items = [dict(i, _ws=ws_id, _wsName=names[ws_id])
+                     for i in api.get(f"/api/workspaces/{ws_id}/items")["value"]]
     except ApiError as e:
         return show_error(e)
+    label = (lambda i: f"{i['name']}   ·   {i['_wsName']}") if ws_id == all_ws else (lambda i: i["name"])
     models = [i for i in items if i["type"] == "SemanticModel"]
     reports = [i for i in items if i["type"] == "Report"]
 
@@ -698,19 +823,19 @@ def page_model_report():
     with c1:
         st.markdown("#### 🔶 Semantic models")
         model = st.selectbox(f"{len(models)} semantic model(s)", models, index=None, key="mr_model",
-                             format_func=lambda i: i["name"], placeholder="Select a semantic model",
+                             format_func=label, placeholder="Select a semantic model",
                              on_change=pick, args=("mr_model",))
     with c2:
         st.markdown("#### 📊 Reports")
         report = st.selectbox(f"{len(reports)} report(s)", reports, index=None, key="mr_report",
-                              format_func=lambda i: i["name"], placeholder="Select a report",
+                              format_func=label, placeholder="Select a report",
                               on_change=pick, args=("mr_report",))
     item = model or report
     if not item:
         st.info("Select a semantic model **or** a report to see the Gold, Silver and Bronze tables behind it.")
         return
     try:
-        key = _run_analysis(ws_id, item)
+        key = _run_analysis(item["_ws"], item)
         if not key:
             return
         d = api.get("/api/lineage/medallion", itemKey=key)
@@ -820,6 +945,19 @@ def require_microsoft_sign_in() -> bool:
     return True
 
 
+# Microsoft sends the person back here with ?code=...&state=... after the sign-in page.
+if api.is_sign_in_callback():
+    with st.spinner("Completing Microsoft sign-in…"):
+        _err = api.complete_sign_in_callback()
+    if _err:
+        st.session_state.sign_in_error = _err
+        st.session_state.signin_how = "👤 My Microsoft account"
+    else:
+        st.session_state.entered = True
+        st.session_state.pop("sample_only", None)
+        workspaces.clear()
+    st.rerun()
+
 if not require_microsoft_sign_in():
     st.stop()
 if not api.sign_in_widget():
@@ -836,7 +974,7 @@ PAGES = {
 }
 # Upload metadata and Administration are intentionally not in the menu.
 
-signed_in = api.fabric_signed_in() or api.SERVICE_PRINCIPAL or st.session_state.get("sample_only")
+signed_in = api.fabric_signed_in() or st.session_state.get("sample_only")
 if not (st.session_state.get("entered") and signed_in):
     st.navigation([st.Page(page_signin, title="Sign in", icon="🔐", default=True)], position="hidden").run()
     st.stop()
@@ -847,8 +985,9 @@ with st.sidebar:
         u = me()
         if api.fabric_signed_in():
             acct = api.signed_in_account()
-            st.caption(f"Signed in · **{u.get('name') or acct.get('username', '')}**")
-            st.caption(acct.get("username", ""))
+            conn = api.connection()
+            st.caption(f"Connected as · **{u.get('name') or acct.get('username', '')}**")
+            st.caption(f"Tenant {conn.get('tenant', '')}")
         elif _auth_configured() and st.user.is_logged_in:
             st.caption(f"Signed in · **{st.user.get('name') or _signed_in_email()}**")
         else:
